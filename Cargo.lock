@@ -379,6 +379,7 @@ dependencies = [
  "clap_complete",
  "crossterm 0.29.0",
  "dirs",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

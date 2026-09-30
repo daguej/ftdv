@@ -1,4 +1,5 @@
 mod cli;
+mod compare;
 mod config;
 mod diff;
 mod git;
@@ -6,6 +7,7 @@ mod icons;
 mod parser;
 mod persistence;
 mod render;
+mod restore;
 mod theme;
 mod tree;
 
@@ -14,9 +16,16 @@ use crate::config::{Config, DiffCommandType};
 use crate::git::GitExecutor;
 use crate::parser::{DiffFileKey, DiffParser, FileDiff};
 use crate::persistence::PersistenceManager;
-use crate::render::{render_diff_content, render_file_list, render_search_box, render_status_line};
+use crate::render::{
+    render_diff_content, render_file_list, render_popup, render_restore_progress,
+    render_search_box, render_status_line,
+};
+use crate::restore::{
+    RestoreAction, RestoreDirection, RestoreJob, RestoreMark, RestoreOp, RestorePlan,
+};
 use crate::theme::Theme;
 use crate::tree::{FileTreeBuilder, FileTreeItem};
+use ansi_to_tui::IntoText;
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -27,6 +36,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
+    text::Text,
     widgets::ListState,
 };
 use std::io::{self, Read};
@@ -50,6 +60,7 @@ struct App {
     config: Config,
     theme: Theme,
     diff_output: String,
+    diff_cache: Option<DiffCache>, // Derived from diff_output; built on demand
     file_tree_items: Vec<FileTreeItem>,
     original_file_diffs: Vec<FileDiff>, // Store original file diffs
     selected_index: usize,
@@ -67,6 +78,37 @@ struct App {
     filtered_file_tree_items: Vec<FileTreeItem>, // Filtered items for search
     // UI state
     file_list_state: ListState, // For stateful file tree scrolling
+    popup: Option<Popup>,
+    status_message: Option<String>, // Shown until the next key press
+    // Restoring files between compared paths
+    restore_targets: Option<compare::Targets>, // Set when comparing files/directories
+    restore_marks: std::collections::BTreeMap<String, RestoreMark>,
+    restore_job: Option<RestoreJob>,
+}
+
+/// Rendering data derived from the diff output, so frames don't re-parse it
+struct DiffCache {
+    text: Text<'static>,
+    line_count: u16,
+    max_line_width: u16,
+}
+
+/// How the marked files under a file list item will be restored
+struct RestoreIndicator {
+    /// Direction arrow, or ↔ when marked in both directions
+    arrow: char,
+    action: RestoreAction,
+    /// Number of marked files
+    marked: usize,
+}
+
+/// Scrollable text shown over the main view
+struct Popup {
+    title: String,
+    lines: Vec<String>,
+    scroll: u16,
+    /// Furthest scroll that still fills the popup, as last rendered
+    max_scroll: u16,
 }
 
 impl App {
@@ -88,11 +130,19 @@ impl App {
         let persistence_manager = PersistenceManager::new()?;
 
         // Initialize git executor if needed for interactive file viewing
-        let git_executor = if operation_mode.requires_git_repo() {
+        let git_executor = if operation_mode.requires_git_repo()
+            || matches!(operation_mode, OperationMode::Compare { .. })
+        {
             Some(GitExecutor::new())
         } else {
             None
         };
+
+        let restore_targets = GitExecutor::new()
+            .path_compare_targets(&operation_mode)
+            .ok()
+            .flatten()
+            .and_then(|(target1, target2)| compare::Targets::resolve(target1, target2).ok());
 
         // Load existing check states
         let diff_keys: Vec<DiffFileKey> = file_diffs
@@ -109,6 +159,7 @@ impl App {
             config,
             theme,
             diff_output,
+            diff_cache: None,
             file_tree_items: file_tree_items.clone(),
             original_file_diffs: file_diffs,
             selected_index: 0,
@@ -128,7 +179,47 @@ impl App {
                 state.select(Some(0));
                 state
             },
+            popup: None,
+            status_message: None,
+            restore_targets,
+            restore_marks: std::collections::BTreeMap::new(),
+            restore_job: None,
         })
+    }
+
+    fn set_diff_output(&mut self, output: String) {
+        self.diff_output = output;
+        self.diff_cache = None;
+    }
+
+    /// Parsed diff output, built on first use after the output changes
+    fn diff_cache(&mut self) -> &DiffCache {
+        if self.diff_cache.is_none() {
+            // Convert ANSI sequences to ratatui Text if they exist, otherwise use plain text
+            let text = if self.contains_ansi_codes(&self.diff_output) {
+                // Parse ANSI codes using ansi-to-tui, falling back to plain text on failure
+                self.diff_output
+                    .into_text()
+                    .unwrap_or_else(|_| Text::from(self.diff_output.clone()))
+            } else {
+                Text::from(self.diff_output.clone())
+            };
+
+            // Calculate the maximum display width, accounting for ANSI escape sequences
+            let max_line_width = self
+                .diff_output
+                .lines()
+                .map(|line| self.calculate_display_width(line))
+                .max()
+                .unwrap_or(0) as u16;
+
+            self.diff_cache = Some(DiffCache {
+                text,
+                line_count: self.diff_output.lines().count() as u16,
+                max_line_width,
+            });
+        }
+        self.diff_cache.as_ref().unwrap()
     }
 
     fn select_next(&mut self) {
@@ -156,16 +247,16 @@ impl App {
                 if let Some(ref git_executor) = self.git_executor {
                     match git_executor.get_file_diff(&self.operation_mode, &tree_item.full_path) {
                         Ok(fresh_diff) => {
-                            self.diff_output = fresh_diff;
+                            self.set_diff_output(fresh_diff);
                         }
                         Err(_) => {
                             // Fallback to stored diff content
-                            self.diff_output = file_diff.content.clone();
+                            self.set_diff_output(file_diff.content.clone());
                         }
                     }
                 } else {
                     // Use stored diff content
-                    self.diff_output = file_diff.content.clone();
+                    self.set_diff_output(file_diff.content.clone());
                 }
 
                 // Apply external diff tool if configured
@@ -181,7 +272,7 @@ impl App {
                 self.horizontal_scroll = 0;
             } else {
                 // Directory selected - show directory info
-                self.diff_output = format!("Directory: {}", tree_item.full_path);
+                self.set_diff_output(format!("Directory: {}", tree_item.full_path));
                 self.vertical_scroll = 0;
                 self.horizontal_scroll = 0;
             }
@@ -201,7 +292,7 @@ impl App {
             DiffCommandType::Pager(_) | DiffCommandType::External(_) => {
                 match self.execute_external_diff_tool_with_width(&self.diff_output, width) {
                     Ok(processed_output) => {
-                        self.diff_output = processed_output;
+                        self.set_diff_output(processed_output);
                     }
                     Err(e) => {
                         // Log error but continue with original output
@@ -656,6 +747,228 @@ impl App {
         }
     }
 
+    /// Collapse the selected directory, or select the parent directory of anything else
+    fn collapse_or_select_parent(&mut self) {
+        let Some(item) = self.file_tree_items.get(self.selected_index) else {
+            return;
+        };
+        if item.is_directory && item.is_expanded {
+            self.toggle_directory();
+        } else if let Some(parent_index) = self.file_tree_items[..self.selected_index]
+            .iter()
+            .rposition(|candidate| candidate.depth < item.depth)
+        {
+            self.selected_index = parent_index;
+            self.file_list_state.select(Some(self.selected_index));
+            self.update_diff_content();
+        }
+    }
+
+    fn expand_directory(&mut self) {
+        if let Some(item) = self.file_tree_items.get(self.selected_index) {
+            if item.is_directory && !item.is_expanded {
+                self.toggle_directory();
+            }
+        }
+    }
+
+    /// Mark the selected file, or every file under the selected directory, to make the other
+    /// side match in a direction: copying files, or deleting ones the source side lacks.
+    /// Marking items that are all already marked in that direction unmarks them.
+    fn mark_for_restore(&mut self, direction: RestoreDirection) {
+        let Some(targets) = &self.restore_targets else {
+            self.status_message = Some(
+                "Copying and deleting are only available when comparing files or directories"
+                    .to_string(),
+            );
+            return;
+        };
+        let Some(item) = self.get_current_file_tree_items().get(self.selected_index) else {
+            return;
+        };
+
+        let paths: Vec<String> = if item.is_directory {
+            let prefix = format!("{}/", item.full_path);
+            self.original_file_diffs
+                .iter()
+                .filter(|file_diff| file_diff.filename.starts_with(&prefix))
+                .map(|file_diff| file_diff.filename.clone())
+                .collect()
+        } else {
+            vec![item.full_path.clone()]
+        };
+        let marks: Vec<(String, RestoreMark)> = paths
+            .into_iter()
+            .filter_map(|path| {
+                let op = RestoreOp::plan(targets, &path, direction)?;
+                Some((path, op.mark()))
+            })
+            .collect();
+
+        if marks.is_empty() {
+            self.status_message = Some(format!(
+                "Nothing to copy or delete {}",
+                direction.description()
+            ));
+        } else if marks.iter().all(|(path, _)| {
+            self.restore_marks
+                .get(path)
+                .is_some_and(|mark| mark.direction == direction)
+        }) {
+            for (path, _) in &marks {
+                self.restore_marks.remove(path);
+            }
+        } else {
+            self.restore_marks.extend(marks);
+        }
+    }
+
+    /// Whether files or directories are being compared, rather than git changes
+    fn is_path_compare(&self) -> bool {
+        self.restore_targets.is_some()
+    }
+
+    /// How a marked file, or the marked files under a directory, will be restored
+    fn restore_indicator(&self, item: &FileTreeItem) -> Option<RestoreIndicator> {
+        if !item.is_directory {
+            return self
+                .restore_marks
+                .get(&item.full_path)
+                .map(|mark| RestoreIndicator {
+                    arrow: mark.direction.arrow(),
+                    action: mark.action,
+                    marked: 1,
+                });
+        }
+        let prefix = format!("{}/", item.full_path);
+        let mut marks = self
+            .restore_marks
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .map(|(_, mark)| *mark);
+        let first = marks.next()?;
+        let (mut marked, mut same_direction, mut all_delete) =
+            (1, true, first.action == RestoreAction::Delete);
+        for mark in marks {
+            marked += 1;
+            same_direction &= mark.direction == first.direction;
+            all_delete &= mark.action == RestoreAction::Delete;
+        }
+        Some(RestoreIndicator {
+            arrow: if same_direction {
+                first.direction.arrow()
+            } else {
+                '↔'
+            },
+            // Shown as a deletion only when every marked file will be deleted
+            action: if all_delete {
+                RestoreAction::Delete
+            } else {
+                RestoreAction::Copy
+            },
+            marked,
+        })
+    }
+
+    /// Plan the marked operations against the current files, dropping marks with nothing
+    /// left to do
+    fn restore_plan(&mut self) -> Option<RestorePlan> {
+        let targets = self.restore_targets.as_ref()?;
+        let mut ops = Vec::new();
+        self.restore_marks.retain(|path, mark| {
+            let Some(op) = RestoreOp::plan(targets, path, mark.direction) else {
+                return false;
+            };
+            *mark = op.mark();
+            ops.push(op);
+            true
+        });
+        if ops.is_empty() {
+            self.status_message = Some("No files marked (r: restore ←, R: restore →)".to_string());
+            return None;
+        }
+        Some(RestorePlan::new(targets, ops))
+    }
+
+    fn preview_restore(&mut self) {
+        let Some(plan) = self.restore_plan() else {
+            return;
+        };
+        let lines = plan.preview();
+        self.popup = Some(Popup {
+            title: format!(" Preview: {} commands (Esc: close) ", lines.len()),
+            lines,
+            scroll: 0,
+            max_scroll: 0,
+        });
+    }
+
+    fn start_restore(&mut self) {
+        if let Some(plan) = self.restore_plan() {
+            self.restore_job = Some(RestoreJob::start(plan));
+        }
+    }
+
+    /// Once a restore job finishes, drop the restored files from the list and show the
+    /// results
+    fn poll_restore_job(&mut self) {
+        if !self
+            .restore_job
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            return;
+        }
+        let outcome = self.restore_job.take().unwrap().finish();
+
+        // Restored files now match the other side
+        let completed: std::collections::HashSet<&String> = outcome.completed.iter().collect();
+        self.restore_marks
+            .retain(|path, _| !completed.contains(path));
+        self.original_file_diffs
+            .retain(|file_diff| !completed.contains(&file_diff.filename));
+        self.rebuild_file_tree();
+        if self.search_mode {
+            self.update_search_filter();
+        }
+        if self.original_file_diffs.is_empty() {
+            self.set_diff_output("No differences remaining".to_string());
+        } else {
+            self.update_diff_content();
+        }
+
+        self.popup = Some(Popup {
+            title: " Restore complete (Esc: close) ".to_string(),
+            lines: outcome.summary(),
+            scroll: 0,
+            max_scroll: 0,
+        });
+    }
+
+    fn handle_popup_key(&mut self, code: KeyCode) {
+        let Some(popup) = &mut self.popup else {
+            return;
+        };
+        let max_scroll = popup.max_scroll;
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('P') => {
+                self.popup = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => popup.scroll = popup.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => popup.scroll = popup.scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char('d') => {
+                popup.scroll = popup.scroll.saturating_add(10)
+            }
+            KeyCode::PageUp | KeyCode::Char('u') => popup.scroll = popup.scroll.saturating_sub(10),
+            KeyCode::Char('g') => popup.scroll = 0,
+            KeyCode::Char('G') => popup.scroll = max_scroll,
+            _ => {}
+        }
+        if let Some(popup) = &mut self.popup {
+            popup.scroll = popup.scroll.min(max_scroll);
+        }
+    }
+
     fn rebuild_file_tree(&mut self) {
         // Use original file diffs instead of extracting from current items
         self.file_tree_items = FileTreeBuilder::build_file_tree_with_collapsed(
@@ -696,7 +1009,7 @@ impl App {
                         // Apply diff tool with width
                         match self.execute_external_diff_tool_with_width(&base_diff, Some(width)) {
                             Ok(processed_output) => {
-                                self.diff_output = processed_output;
+                                self.set_diff_output(processed_output);
                             }
                             Err(e) => {
                                 eprintln!("Warning: Failed to refresh diff with width: {e}");
@@ -737,7 +1050,7 @@ impl App {
                             terminal_width,
                         ) {
                             Ok(processed_output) => {
-                                self.diff_output = processed_output;
+                                self.set_diff_output(processed_output);
                             }
                             Err(e) => {
                                 eprintln!("Warning: Failed to refresh diff with area width: {e}");
@@ -752,15 +1065,9 @@ impl App {
     /// Clamp scroll values to valid ranges based on content and viewport size
     fn clamp_scroll(&mut self, viewport_height: u16, viewport_width: u16) {
         // Calculate content dimensions
-        let content_height = self.diff_output.lines().count() as u16;
-
-        // Calculate the maximum display width, accounting for ANSI escape sequences
-        let max_line_width = self
-            .diff_output
-            .lines()
-            .map(|line| self.calculate_display_width(line))
-            .max()
-            .unwrap_or(0) as u16;
+        let cache = self.diff_cache();
+        let content_height = cache.line_count;
+        let max_line_width = cache.max_line_width;
 
         // Account for borders (subtract 2 for top and bottom borders)
         let available_height = viewport_height.saturating_sub(2);
@@ -938,7 +1245,8 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app = App::new(config, file_diffs, operation_mode)?;
+    let mut app = App::new(config, file_diffs, operation_mode)?;
+    app.update_diff_content();
     let res = run_app(&mut terminal, app);
 
     // Restore terminal
@@ -978,6 +1286,10 @@ fn generate_completions(shell: clap_complete::Shell) {
 fn get_diffs_from_git(mode: &OperationMode) -> Result<Vec<FileDiff>> {
     let git_executor = GitExecutor::new();
 
+    if let Some((target1, target2)) = git_executor.path_compare_targets(mode)? {
+        return compare::compare_paths(target1, target2);
+    }
+
     // Get overall diff output
     let diff_output = git_executor.get_diff(mode)?;
 
@@ -1004,12 +1316,39 @@ fn read_input_completely() -> Result<Vec<FileDiff>> {
 }
 
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
+    let mut needs_redraw = true;
     loop {
-        terminal.draw(|f| ui(f, &mut app))?;
+        // Keep redrawing while a restore job runs so its progress advances, including the
+        // frame after it finishes
+        let job_running = app.restore_job.is_some();
+        app.poll_restore_job();
+        if needs_redraw || job_running {
+            terminal.draw(|f| ui(f, &mut app))?;
+            needs_redraw = false;
+        }
 
         // Use poll to handle the case where stdin might not be available
         if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            let event = event::read()?;
+            if matches!(event, Event::Resize(..)) {
+                needs_redraw = true;
+            }
+            if let Event::Key(key) = event {
+                needs_redraw = true;
+                app.status_message = None;
+
+                // A running copy can only be cancelled
+                if let Some(job) = &app.restore_job {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                        job.cancel();
+                    }
+                    continue;
+                }
+                if app.popup.is_some() {
+                    app.handle_popup_key(key.code);
+                    continue;
+                }
+
                 match key.code {
                     // Quit or exit search mode
                     KeyCode::Char('q') => {
@@ -1087,13 +1426,13 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, mut app: Ap
                     KeyCode::Char('f') if !app.search_input_mode => app.scroll_down(20),
                     KeyCode::Char('b') if !app.search_input_mode => app.scroll_up(20),
 
+                    // Directory collapse/expand (search results aren't a collapsible tree)
+                    KeyCode::Left if !app.search_mode => app.collapse_or_select_parent(),
+                    KeyCode::Right if !app.search_mode => app.expand_directory(),
+
                     // Horizontal scrolling (disabled only when typing in search)
-                    KeyCode::Char('h') | KeyCode::Left if !app.search_input_mode => {
-                        app.scroll_left(5)
-                    }
-                    KeyCode::Char('l') | KeyCode::Right if !app.search_input_mode => {
-                        app.scroll_right(5)
-                    }
+                    KeyCode::Char('h') if !app.search_input_mode => app.scroll_left(5),
+                    KeyCode::Char('l') if !app.search_input_mode => app.scroll_right(5),
                     KeyCode::Char('H') if !app.search_input_mode => app.scroll_left(20),
                     KeyCode::Char('L') if !app.search_input_mode => app.scroll_right(20),
 
@@ -1105,6 +1444,16 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, mut app: Ap
 
                     // Checkbox toggle (works in both modes)
                     KeyCode::Tab => app.toggle_file_checked(),
+
+                    // Copying and deleting between compared files/directories
+                    KeyCode::Char('r') if !app.search_input_mode => {
+                        app.mark_for_restore(RestoreDirection::RightToLeft)
+                    }
+                    KeyCode::Char('R') if !app.search_input_mode => {
+                        app.mark_for_restore(RestoreDirection::LeftToRight)
+                    }
+                    KeyCode::Char('P') if !app.search_input_mode => app.preview_restore(),
+                    KeyCode::Char('X') if !app.search_input_mode => app.start_restore(),
 
                     _ => {}
                 }
@@ -1145,6 +1494,12 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     render_status_line(f, right_chunks[0], app);
     render_diff_content(f, right_chunks[1], app);
+
+    if let Some(job) = &app.restore_job {
+        render_restore_progress(f, job, app);
+    } else if app.popup.is_some() {
+        render_popup(f, app);
+    }
 }
 
 #[cfg(test)]
@@ -1180,6 +1535,56 @@ mod tests {
     }
 
     #[test]
+    fn test_arrow_keys_collapse_and_expand_directories() {
+        let file_diffs = ["dir/a.rs", "dir/b.rs", "top.rs"]
+            .map(|filename| FileDiff {
+                filename: filename.to_string(),
+                old_path: None,
+                new_path: None,
+                content: String::new(),
+                added_lines: 0,
+                removed_lines: 0,
+                diff_key: None,
+                change: None,
+            })
+            .to_vec();
+        let mut app = App::new(
+            Config::default(),
+            file_diffs,
+            OperationMode::GitWorkingDirectory,
+        )
+        .unwrap();
+        let names = |app: &App| {
+            app.file_tree_items
+                .iter()
+                .map(|item| item.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), ["dir", "a.rs", "b.rs", "top.rs"]);
+
+        // Left on a file selects its directory, then collapses it
+        app.selected_index = 2;
+        app.collapse_or_select_parent();
+        assert_eq!(app.selected_index, 0);
+        app.collapse_or_select_parent();
+        assert_eq!(names(&app), ["dir", "top.rs"]);
+        assert_eq!(app.selected_index, 0);
+
+        // Left on a collapsed top-level directory does nothing
+        app.collapse_or_select_parent();
+        assert_eq!(names(&app), ["dir", "top.rs"]);
+
+        app.expand_directory();
+        assert_eq!(names(&app), ["dir", "a.rs", "b.rs", "top.rs"]);
+
+        // Right on an expanded directory or a file does nothing
+        app.expand_directory();
+        app.selected_index = 1;
+        app.expand_directory();
+        assert_eq!(names(&app), ["dir", "a.rs", "b.rs", "top.rs"]);
+    }
+
+    #[test]
     fn test_render_file_list() {
         let backend = TestBackend::new(40, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1193,6 +1598,7 @@ mod tests {
                 added_lines: 1,
                 removed_lines: 0,
                 diff_key: None,
+                change: None,
             },
             FileDiff {
                 filename: "test2.rs".to_string(),
@@ -1202,6 +1608,7 @@ mod tests {
                 added_lines: 0,
                 removed_lines: 1,
                 diff_key: None,
+                change: None,
             },
         ];
         let mut app = App::new(config, file_diffs, OperationMode::GitWorkingDirectory).unwrap();

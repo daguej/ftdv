@@ -80,8 +80,8 @@ ftdv completions bash > ftdv.bash
 *** Diff Content Scrolling
 | Key              | Action                      |
 |------------------+-----------------------------|
-| =h= / =←=        | Scroll diff left (5 chars)  |
-| =l= / =→=        | Scroll diff right (5 chars) |
+| =h=              | Scroll diff left (5 chars)  |
+| =l=              | Scroll diff right (5 chars) |
 | =H=              | Scroll diff left (20 chars) |
 | =L=              | Scroll diff right (20 chars)|
 | =e= / =J=        | Scroll diff down (1 line)   |
@@ -95,8 +95,28 @@ ftdv completions bash > ftdv.bash
 | Key     | Action                      |
 |---------+-----------------------------|
 | =Enter= | Expand/collapse directory   |
+| =←=    | Collapse directory, or select parent |
+| =→=    | Expand directory            |
 | =Space= | Update diff content         |
 | =Tab=   | Toggle file checkbox        |
+
+*** Restoring Between Compared Directories
+When comparing two files or directories, either side can be made to match the other:
+files are copied from the source side, and files missing from the source side are deleted.
+Marking a directory marks every listed file under it; marking again unmarks. Marked files
+show a yellow arrow when they'll be copied, and a red one when they'll be deleted.
+
+| Key | Action |
+|-----+--------|
+| =r= | Mark to restore right to left (←) |
+| =R= | Mark to restore left to right (→) |
+| =P= | Preview as =cp=, =rm= and =rmdir= commands |
+| =X= | Run all marked operations (=Esc= cancels) |
+
+Copies are reflinked where the filesystem supports it, and keep the source's permissions
+and access/modification times, plus its owner and group where permitted (the group alone,
+or neither, when not running as root). Directories left empty by deletions are removed
+unless they exist on the source side.
 
 *** Search
 | Key        | Action                      |

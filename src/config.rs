@@ -189,8 +189,10 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let config_path = Self::config_path()?;
+        self.save_to_path_buf(&Self::config_path()?)
+    }
 
+    fn save_to_path_buf(&self, config_path: &PathBuf) -> Result<()> {
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create config directory: {parent:?}"))?;
@@ -198,7 +200,7 @@ impl Config {
 
         let yaml = serde_yaml::to_string(self).with_context(|| "Failed to serialize config")?;
 
-        fs::write(&config_path, yaml)
+        fs::write(config_path, yaml)
             .with_context(|| format!("Failed to write config file: {config_path:?}"))?;
 
         Ok(())
@@ -214,7 +216,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use tempfile::TempDir;
 
     #[test]
@@ -292,19 +293,16 @@ mod tests {
 
     #[test]
     fn test_config_save_load() -> Result<()> {
+        // Use an explicit path rather than overriding HOME, which would affect tests
+        // running in parallel
         let temp_dir = TempDir::new()?;
-        let temp_home = temp_dir.path().to_path_buf();
-
-        // Override home directory for testing
-        unsafe {
-            env::set_var("HOME", &temp_home);
-        }
+        let config_path = temp_dir.path().join("ftdv").join("config.yaml");
 
         let mut config = Config::default();
         config.git.paging.pager = "delta --dark".to_string();
-        config.save()?;
+        config.save_to_path_buf(&config_path)?;
 
-        let loaded_config = Config::load()?;
+        let loaded_config = Config::load_from_path_buf(&config_path)?;
 
         assert_eq!(config.git.paging.pager, loaded_config.git.paging.pager);
         assert_eq!(

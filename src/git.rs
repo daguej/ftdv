@@ -35,14 +35,30 @@ impl GitExecutor {
                 if self.is_git_ref(target1)? && self.is_git_ref(target2)? {
                     self.execute_git_diff(&["diff", &format!("{target1}..{target2}")])
                 } else {
-                    // Fall back to regular diff for files/directories
-                    self.execute_regular_diff(target1, target2)
+                    Err(anyhow!(
+                        "File/directory comparisons are handled by compare::compare_paths"
+                    ))
                 }
             }
             OperationMode::Completions { .. } => {
                 Err(anyhow!("Completions mode should not call get_diff"))
             }
             OperationMode::Invalid { reason } => Err(anyhow!("Invalid operation mode: {}", reason)),
+        }
+    }
+
+    /// The two targets of a comparison between files or directories rather than git refs
+    pub fn path_compare_targets<'a>(
+        &self,
+        mode: &'a OperationMode,
+    ) -> Result<Option<(&'a str, &'a str)>> {
+        match mode {
+            OperationMode::Compare { target1, target2 }
+                if !(self.is_git_ref(target1)? && self.is_git_ref(target2)?) =>
+            {
+                Ok(Some((target1, target2)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -99,8 +115,7 @@ impl GitExecutor {
                         file_path,
                     ])
                 } else {
-                    // For file comparison, assume the file_path is one of the targets
-                    self.execute_regular_diff(target1, target2)
+                    crate::compare::file_diff(target1, target2, file_path)
                 }
             }
             OperationMode::Completions { .. } => {
@@ -145,22 +160,6 @@ impl GitExecutor {
             .filter(|line| !line.is_empty())
             .map(|line| line.to_string())
             .collect())
-    }
-
-    /// Execute regular diff command for non-git files
-    fn execute_regular_diff(&self, file1: &str, file2: &str) -> Result<String> {
-        let output = Command::new("diff")
-            .args(["-u", file1, file2])
-            .output()
-            .context("Failed to execute diff")?;
-
-        // diff returns exit code 1 when files differ, which is normal
-        if output.status.code() == Some(2) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("Diff command failed: {}", stderr));
-        }
-
-        String::from_utf8(output.stdout).context("Diff output is not valid UTF-8")
     }
 
     /// Check if a string is a valid git ref

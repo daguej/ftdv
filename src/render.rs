@@ -1,11 +1,12 @@
 use crate::App;
-use ansi_to_tui::IntoText;
+use crate::parser::FileChange;
+use crate::restore::{RestoreAction, RestoreJob};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::Style,
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 
 pub fn render_file_list(f: &mut Frame, area: Rect, app: &mut App) {
@@ -119,12 +120,66 @@ pub fn render_file_list(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             };
 
+            // Add stats for files or collapsed directories, with an arrow replacing the line
+            // counts when files are marked to be copied
+            let restore_indicator = app.restore_indicator(tree_item);
+            let line_counts = |added: usize, removed: usize| {
+                [
+                    Span::styled(
+                        format!("+{added} "),
+                        Style::default().fg(app.theme.colors.status_added.0),
+                    ),
+                    Span::styled(
+                        format!("-{removed}"),
+                        Style::default().fg(app.theme.colors.status_removed.0),
+                    ),
+                ]
+            };
+            let mut stats = Vec::new();
+            if tree_item.is_directory && !tree_item.is_expanded && tree_item.dir_file_count > 0 {
+                // Show directory statistics when collapsed, with the number of marked files.
+                // Compared files have no line counts.
+                if let Some(indicator) = &restore_indicator {
+                    stats.push(Span::styled(
+                        indicator.marked.to_string(),
+                        Style::default().fg(app.theme.colors.status_modified.0),
+                    ));
+                    stats.push(Span::raw("/"));
+                }
+                stats.push(Span::raw(format!("{} files ", tree_item.dir_file_count)));
+                if restore_indicator.is_none() && !app.is_path_compare() {
+                    stats.extend(line_counts(
+                        tree_item.dir_added_lines,
+                        tree_item.dir_removed_lines,
+                    ));
+                }
+            } else if let Some(file_diff) = &tree_item.file_diff {
+                if restore_indicator.is_none() {
+                    match file_diff.change {
+                        Some(change) => stats.push(change_span(change, app)),
+                        None => stats
+                            .extend(line_counts(file_diff.added_lines, file_diff.removed_lines)),
+                    }
+                }
+            }
+            if let Some(indicator) = restore_indicator {
+                stats.push(Span::styled(
+                    indicator.arrow.to_string(),
+                    Style::default().fg(restore_color(indicator.action, app)),
+                ));
+            }
+
             // Calculate available space for the name
             let tree_prefix_width = tree_prefix.chars().count();
             let checkbox_width = if !tree_item.is_directory { 2 } else { 0 }; // Checkbox + space for files only
             let icon_width = 2; // Icon + space
-            let stats_width = if tree_item.file_diff.is_some() { 10 } else { 0 }; // Rough estimate for stats
-            let used_width = tree_prefix_width + checkbox_width + icon_width + stats_width;
+            let stats_width: usize = stats.iter().map(|span| span.content.chars().count()).sum();
+            // Leave a space between the name and any stats
+            let used_width = tree_prefix_width
+                + checkbox_width
+                + icon_width
+                + stats_width
+                + usize::from(stats_width > 0);
             let available_name_width = available_width.saturating_sub(used_width);
 
             // Truncate name if too long
@@ -140,53 +195,16 @@ pub fn render_file_list(f: &mut Frame, area: Rect, app: &mut App) {
 
             spans.push(Span::styled(display_name.clone(), name_style));
 
-            // Add stats for files or collapsed directories
-            let stats_to_show =
-                if tree_item.is_directory && !tree_item.is_expanded && tree_item.dir_file_count > 0
-                {
-                    // Show directory statistics when collapsed
-                    Some(format!(
-                        " {} files +{} -{}",
-                        tree_item.dir_file_count,
-                        tree_item.dir_added_lines,
-                        tree_item.dir_removed_lines
-                    ))
-                } else {
-                    tree_item
-                        .file_diff
-                        .as_ref()
-                        .map(|file_diff| file_diff.diff_stats())
-                };
-
-            if let Some(stats) = stats_to_show {
+            if !stats.is_empty() {
                 let current_width = tree_prefix.chars().count() +
                                    checkbox_width + // checkbox width (0 for directories, 2 for files)
                                    2 + // icon width
                                    display_name.chars().count();
-
-                let stats_parts: Vec<&str> = stats.split_whitespace().collect();
-                let stats_width = stats.chars().count();
-
+                // Keep at least one space between the name and the stats
                 if current_width + stats_width < available_width {
                     let padding = available_width - current_width - stats_width;
                     spans.push(Span::raw(" ".repeat(padding)));
-
-                    // Parse and color the stats
-                    for part in stats_parts {
-                        if part.starts_with('+') {
-                            spans.push(Span::styled(
-                                format!("{part} "),
-                                Style::default().fg(app.theme.colors.status_added.0),
-                            ));
-                        } else if part.starts_with('-') {
-                            spans.push(Span::styled(
-                                part.to_string(),
-                                Style::default().fg(app.theme.colors.status_removed.0),
-                            ));
-                        } else {
-                            spans.push(Span::raw(format!("{part} ")));
-                        }
-                    }
+                    spans.extend(stats);
                 }
             }
 
@@ -243,28 +261,20 @@ pub fn render_diff_content(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // Convert ANSI sequences to ratatui Text if they exist, otherwise use plain text
-    let text_content = if app.contains_ansi_codes(&app.diff_output) {
-        // Parse ANSI codes using ansi-to-tui
-        match app.diff_output.into_text() {
-            Ok(text) => text,
-            Err(_) => {
-                // Fallback to plain text if ANSI parsing fails
-                Text::from(app.diff_output.as_str())
-            }
-        }
-    } else {
-        // Plain text without ANSI codes
-        Text::from(app.diff_output.as_str())
-    };
+    let text_content = app.diff_cache().text.clone();
 
     let diff_content = Paragraph::new(text_content)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    "Diff Content (using {}) - [h/l: scroll, j/k: files, g/G: jump]",
-                    app.config.get_diff_display_name()
+                    "Diff Content (using {}) - [h/l: scroll, j/k: files, g/G: jump{}]",
+                    app.config.get_diff_display_name(),
+                    if app.restore_targets.is_some() {
+                        ", r/R: mark restore ←/→, P: preview, X: run"
+                    } else {
+                        ""
+                    }
                 ))
                 .style(Style::default().fg(app.theme.colors.border.0)),
         )
@@ -309,8 +319,19 @@ pub fn render_status_line(f: &mut Frame, area: Rect, app: &App) {
             ));
             spans.push(Span::raw(" | "));
 
-            // Add colored diff stats
-            let stats_string = file_diff.diff_stats();
+            // Add colored diff stats, or how a compared file changed, or where it will be copied
+            let stats_string = if let Some(mark) = app.restore_marks.get(&tree_item.full_path) {
+                spans.push(Span::styled(
+                    format!("{} {}", mark.direction.arrow(), mark.description()),
+                    Style::default().fg(restore_color(mark.action, app)),
+                ));
+                String::new()
+            } else if let Some(change) = file_diff.change {
+                spans.push(change_span(change, app));
+                String::new()
+            } else {
+                file_diff.diff_stats()
+            };
             let stats_parts: Vec<&str> = stats_string.split_whitespace().collect();
             for (i, part) in stats_parts.iter().enumerate() {
                 if part.starts_with('+') {
@@ -345,6 +366,13 @@ pub fn render_status_line(f: &mut Frame, area: Rect, app: &App) {
         spans
     } else {
         vec![Span::raw(" No item selected")]
+    };
+    let status_spans = match &app.status_message {
+        Some(message) => vec![Span::styled(
+            format!(" {message}"),
+            Style::default().fg(app.theme.colors.status_modified.0),
+        )],
+        None => status_spans,
     };
 
     let status = Paragraph::new(Line::from(status_spans))
@@ -403,4 +431,94 @@ pub fn render_search_box(f: &mut Frame, area: Rect, app: &App) {
         .style(search_style);
 
     f.render_widget(search_box, area);
+}
+
+/// Colored label for how a compared file changed
+fn change_span(change: FileChange, app: &App) -> Span<'static> {
+    let color = match change {
+        FileChange::Added => app.theme.colors.status_added.0,
+        FileChange::Deleted => app.theme.colors.status_removed.0,
+        FileChange::Modified => app.theme.colors.status_modified.0,
+    };
+    Span::styled(change.label(), Style::default().fg(color))
+}
+
+/// Red for deletions, yellow for copies
+fn restore_color(action: RestoreAction, app: &App) -> Color {
+    match action {
+        RestoreAction::Copy => app.theme.colors.status_modified.0,
+        RestoreAction::Delete => app.theme.colors.status_removed.0,
+    }
+}
+
+/// Area of a given size centered in another, shrunk to fit
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+pub fn render_popup(f: &mut Frame, app: &mut App) {
+    let Some(popup) = &mut app.popup else {
+        return;
+    };
+    let full = f.area();
+    let area = centered_rect(full, full.width * 9 / 10, full.height * 8 / 10);
+
+    let text: Vec<Line> = popup
+        .lines
+        .iter()
+        .map(|line| Line::raw(line.as_str()))
+        .collect();
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(popup.title.as_str())
+                .style(Style::default().fg(app.theme.colors.border_focused.0)),
+        )
+        .style(Style::default().fg(app.theme.colors.text_primary.0))
+        .wrap(Wrap { trim: false });
+
+    // Stop scrolling once the last line is at the bottom
+    let line_count = u16::try_from(paragraph.line_count(area.width)).unwrap_or(u16::MAX);
+    popup.max_scroll = line_count.saturating_sub(area.height);
+    popup.scroll = popup.scroll.min(popup.max_scroll);
+    let paragraph = paragraph.scroll((popup.scroll, 0));
+
+    f.render_widget(Clear, area);
+    f.render_widget(paragraph, area);
+}
+
+pub fn render_restore_progress(f: &mut Frame, job: &RestoreJob, app: &App) {
+    let full = f.area();
+    let area = centered_rect(full, full.width * 6 / 10, 3);
+    let (completed, total) = job.progress();
+    let title = if job.is_cancelled() {
+        " Restoring files - cancelling... "
+    } else {
+        " Restoring files (Esc: cancel) "
+    };
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(Style::default().fg(app.theme.colors.border_focused.0)),
+        )
+        .gauge_style(Style::default().fg(app.theme.colors.status_modified.0))
+        .ratio(if total == 0 {
+            1.0
+        } else {
+            completed as f64 / total as f64
+        })
+        .label(format!("{completed} / {total}"));
+
+    f.render_widget(Clear, area);
+    f.render_widget(gauge, area);
 }

@@ -9,6 +9,25 @@ pub struct FileDiff {
     pub added_lines: usize,
     pub removed_lines: usize,
     pub diff_key: Option<DiffFileKey>, // Add key for persistence
+    pub change: Option<FileChange>,    // Set when comparing files/directories
+}
+
+/// How a file differs between compared files/directories, from left (old) to right (new)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    Added,
+    Deleted,
+    Modified,
+}
+
+impl FileChange {
+    pub fn label(self) -> &'static str {
+        match self {
+            FileChange::Added => "add",
+            FileChange::Deleted => "del",
+            FileChange::Modified => "mod",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -99,6 +118,7 @@ impl DiffParser {
                         added_lines: 0,
                         removed_lines: 0,
                         diff_key: None, // Will be set when we parse index line
+                        change: None,
                     });
                 }
                 current_content.clear();

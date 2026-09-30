@@ -46,7 +46,7 @@ impl FileTreeBuilder {
 
         // Then flatten it into display order while preserving hierarchy
         let mut result = Vec::new();
-        Self::flatten_tree_with_collapsed(&root, 0, &mut Vec::new(), &mut result, collapsed_dirs);
+        Self::flatten_tree_with_collapsed(&root, &mut Vec::new(), &mut result, collapsed_dirs);
 
         result
     }
@@ -216,61 +216,97 @@ impl FileTreeBuilder {
         (total_files, total_added, total_removed)
     }
 
+    /// Append a node's children to `result` in display order, descending into expanded
+    /// directories. `ancestors_last` holds, for each ancestor level, whether no connector
+    /// line continues below that ancestor.
     fn flatten_tree_with_collapsed(
         node: &TreeNode,
-        depth: usize,
-        parent_is_last: &mut Vec<bool>,
+        ancestors_last: &mut Vec<bool>,
         result: &mut Vec<FileTreeItem>,
         collapsed_dirs: &HashSet<String>,
     ) {
-        // Skip root node
-        if depth > 0 {
-            let is_last_child = parent_is_last.get(depth - 1).copied().unwrap_or(true);
-            let is_expanded = !collapsed_dirs.contains(&node.full_path);
+        let depth = ancestors_last.len();
+        for (i, child) in node.children.iter().enumerate() {
+            let is_last_child = i == node.children.len() - 1;
+            let is_expanded = !collapsed_dirs.contains(&child.full_path);
 
             result.push(FileTreeItem {
-                name: node.name.clone(),
-                full_path: node.full_path.clone(),
-                is_directory: node.is_directory,
-                depth: depth - 1, // Adjust for skipped root
-                file_diff: node.file_diff.clone(),
+                name: child.name.clone(),
+                full_path: child.full_path.clone(),
+                is_directory: child.is_directory,
+                depth,
+                file_diff: child.file_diff.clone(),
                 is_last_child,
-                parent_is_last: parent_is_last[..depth.saturating_sub(1)].to_vec(),
+                parent_is_last: ancestors_last.clone(),
                 is_expanded,
-                dir_file_count: node.file_count,
-                dir_added_lines: node.added_lines,
-                dir_removed_lines: node.removed_lines,
+                dir_file_count: child.file_count,
+                dir_added_lines: child.added_lines,
+                dir_removed_lines: child.removed_lines,
             });
-        }
 
-        // Process children only if this directory is expanded (or if this is root)
-        let should_show_children = depth == 0 || !collapsed_dirs.contains(&node.full_path);
-
-        if should_show_children {
-            for (i, child) in node.children.iter().enumerate() {
-                let is_last = i == node.children.len() - 1;
-
-                if depth > 0 {
-                    if parent_is_last.len() <= depth {
-                        parent_is_last.push(is_last);
-                    } else {
-                        parent_is_last[depth] = is_last;
-                    }
-                }
-
-                Self::flatten_tree_with_collapsed(
-                    child,
-                    depth + 1,
-                    parent_is_last,
-                    result,
-                    collapsed_dirs,
-                );
+            if child.is_directory && is_expanded {
+                // Top-level items have no connector, so no line continues below them
+                ancestors_last.push(depth == 0 || is_last_child);
+                Self::flatten_tree_with_collapsed(child, ancestors_last, result, collapsed_dirs);
+                ancestors_last.pop();
             }
         }
+    }
+}
 
-        // Clean up
-        if depth > 0 && !parent_is_last.is_empty() {
-            parent_is_last.truncate(depth);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_diff(filename: &str) -> FileDiff {
+        FileDiff {
+            filename: filename.to_string(),
+            old_path: None,
+            new_path: None,
+            content: String::new(),
+            added_lines: 0,
+            removed_lines: 0,
+            diff_key: None,
+            change: None,
         }
+    }
+
+    /// Tree lines as render_file_list draws them
+    fn tree_prefixes(items: &[FileTreeItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| {
+                let mut prefix: String = item
+                    .parent_is_last
+                    .iter()
+                    .map(|&last| if last { "  " } else { "│ " })
+                    .collect();
+                if item.depth > 0 {
+                    prefix.push_str(if item.is_last_child { "╰ " } else { "├ " });
+                }
+                prefix + &item.name
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_tree_connectors() {
+        let diffs = ["d/a", "d/e/x", "d/e/y", "d/z", "top"].map(file_diff);
+        let items = FileTreeBuilder::build_file_tree(&diffs);
+
+        assert_eq!(
+            tree_prefixes(&items),
+            ["d", "  ├ e", "  │ ├ x", "  │ ╰ y", "  ├ a", "  ╰ z", "top",]
+        );
+    }
+
+    #[test]
+    fn test_tree_connectors_with_collapsed_directory() {
+        let diffs = ["d/a", "d/e/x", "d/z"].map(file_diff);
+        let collapsed = HashSet::from(["d/e".to_string()]);
+        let items = FileTreeBuilder::build_file_tree_with_collapsed(&diffs, &collapsed);
+
+        assert_eq!(tree_prefixes(&items), ["d", "  ├ e", "  ├ a", "  ╰ z"]);
+        assert!(!items[1].is_expanded);
     }
 }
