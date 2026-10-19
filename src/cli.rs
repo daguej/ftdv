@@ -27,6 +27,10 @@ pub struct Cli {
     /// Verbose output
     #[arg(long, short)]
     pub verbose: bool,
+
+    /// Don't descend into directories on other filesystems when comparing directories
+    #[arg(long, short = 'x')]
+    pub one_file_system: bool,
 }
 
 #[derive(Subcommand)]
@@ -169,6 +173,7 @@ mod tests {
             worktree: false,
             config: None,
             verbose: false,
+            one_file_system: false,
         };
 
         match cli.get_operation_mode() {
@@ -186,6 +191,7 @@ mod tests {
             worktree: false,
             config: None,
             verbose: false,
+            one_file_system: false,
         };
 
         match cli.get_operation_mode() {
@@ -203,6 +209,7 @@ mod tests {
             worktree: false,
             config: None,
             verbose: false,
+            one_file_system: false,
         };
 
         match cli.get_operation_mode() {
@@ -220,6 +227,7 @@ mod tests {
             worktree: false,
             config: None,
             verbose: false,
+            one_file_system: false,
         };
 
         match cli.get_operation_mode() {

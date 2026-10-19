@@ -62,6 +62,9 @@ ftdv file1.txt file2.txt
 # Compare two directories
 ftdv dir1/ dir2/
 
+# Compare two directories without descending into other filesystems
+ftdv -x dir1/ dir2/
+
 # Generate shell completions
 ftdv completions bash > ftdv.bash
 ```

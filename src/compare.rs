@@ -9,15 +9,28 @@ use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Find the files that differ between two files or directories
-pub fn compare_paths(target1: &str, target2: &str) -> Result<Vec<FileDiff>> {
+/// Find the files that differ between two files or directories. With `one_file_system`,
+/// directories on a different filesystem than their side's root are treated as empty.
+pub fn compare_paths(target1: &str, target2: &str, one_file_system: bool) -> Result<Vec<FileDiff>> {
     let targets = Targets::resolve(target1, target2)?;
+    let root_devices = if one_file_system && targets.both_dirs {
+        let device = |root: &Path| {
+            fs::metadata(root)
+                .map(|metadata| Some(metadata.dev()))
+                .with_context(|| format!("Cannot access {}", root.display()))
+        };
+        [device(&targets.left)?, device(&targets.right)?]
+    } else {
+        [None, None]
+    };
     let mut walker = Walker {
         targets: &targets,
+        root_devices,
         changes: Vec::new(),
     };
 
@@ -204,6 +217,8 @@ impl Entry {
 
 struct Walker<'a> {
     targets: &'a Targets,
+    /// Devices of the left and right roots, when not crossing filesystem boundaries
+    root_devices: [Option<u64>; 2],
     changes: Vec<FileDiff>,
 }
 
@@ -212,18 +227,21 @@ impl Walker<'_> {
     fn compare_dir(&mut self, rel: &Path, left: &Entry, right: &Entry) {
         let left_path = self.targets.left.join(rel);
         let right_path = self.targets.right.join(rel);
-        let (left_names, right_names) =
-            match (list_dir(&left_path, left), list_dir(&right_path, right)) {
-                (Ok(left_names), Ok(right_names)) => (left_names, right_names),
-                (Err(left_error), Err(right_error)) if left_error == right_error => return,
-                (left_names, right_names) => {
-                    // The contents can't be compared, so report the directory itself
-                    let left = left_names.map_or_else(Entry::UnreadableDir, |_| left.clone());
-                    let right = right_names.map_or_else(Entry::UnreadableDir, |_| right.clone());
-                    self.report(rel, left, right);
-                    return;
-                }
-            };
+        let [left_device, right_device] = self.root_devices;
+        let (left_names, right_names) = match (
+            list_dir(&left_path, left, left_device),
+            list_dir(&right_path, right, right_device),
+        ) {
+            (Ok(left_names), Ok(right_names)) => (left_names, right_names),
+            (Err(left_error), Err(right_error)) if left_error == right_error => return,
+            (left_names, right_names) => {
+                // The contents can't be compared, so report the directory itself
+                let left = left_names.map_or_else(Entry::UnreadableDir, |_| left.clone());
+                let right = right_names.map_or_else(Entry::UnreadableDir, |_| right.clone());
+                self.report(rel, left, right);
+                return;
+            }
+        };
 
         for name in left_names.union(&right_names) {
             let child = rel.join(name);
@@ -278,11 +296,21 @@ impl Walker<'_> {
     }
 }
 
-/// Names in a directory, or none if the entry isn't a directory. Entries that can't be read
-/// are skipped.
-fn list_dir(path: &Path, entry: &Entry) -> Result<BTreeSet<OsString>, String> {
+/// Names in a directory, or none if the entry isn't a directory or is on a different device
+/// than `root_device`. Entries that can't be read are skipped.
+fn list_dir(
+    path: &Path,
+    entry: &Entry,
+    root_device: Option<u64>,
+) -> Result<BTreeSet<OsString>, String> {
     if *entry != Entry::Dir {
         return Ok(BTreeSet::new());
+    }
+    if let Some(root_device) = root_device {
+        // If the metadata can't be read, listing the directory will report the error
+        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.dev() != root_device) {
+            return Ok(BTreeSet::new());
+        }
     }
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
     Ok(entries
@@ -454,11 +482,12 @@ mod tests {
     }
 
     fn changed_files(left: &Path, right: &Path) -> Vec<String> {
-        let mut files: Vec<_> = compare_paths(&left.to_string_lossy(), &right.to_string_lossy())
-            .unwrap()
-            .into_iter()
-            .map(|file| file.filename)
-            .collect();
+        let mut files: Vec<_> =
+            compare_paths(&left.to_string_lossy(), &right.to_string_lossy(), false)
+                .unwrap()
+                .into_iter()
+                .map(|file| file.filename)
+                .collect();
         files.sort();
         files
     }
@@ -506,6 +535,7 @@ mod tests {
         let mut changes: Vec<_> = compare_paths(
             &left.path().to_string_lossy(),
             &right.path().to_string_lossy(),
+            false,
         )
         .unwrap()
         .into_iter()
@@ -589,6 +619,18 @@ mod tests {
         if enforced {
             assert_eq!(files, ["changed", "left-locked"]);
         }
+    }
+
+    #[test]
+    fn test_list_dir_skips_other_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("f"), "x", 1_000);
+        let device = fs::metadata(dir.path()).unwrap().dev();
+
+        let names = |root_device| list_dir(dir.path(), &Entry::Dir, root_device).unwrap();
+        assert_eq!(names(None).len(), 1);
+        assert_eq!(names(Some(device)).len(), 1);
+        assert!(names(Some(device.wrapping_add(1))).is_empty());
     }
 
     #[test]

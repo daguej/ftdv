@@ -1221,14 +1221,14 @@ fn main() -> Result<()> {
             if cli.verbose {
                 eprintln!("Debug: No stdin input, falling back to git executor");
             }
-            get_diffs_from_git(&operation_mode).unwrap_or_default()
+            get_diffs_from_git(&operation_mode, cli.one_file_system).unwrap_or_default()
         })
     } else {
         // Interactive mode: use git executor
         if cli.verbose {
             eprintln!("Debug: Using git executor mode");
         }
-        get_diffs_from_git(&operation_mode)?
+        get_diffs_from_git(&operation_mode, cli.one_file_system)?
     };
 
     if file_diffs.is_empty() {
@@ -1283,11 +1283,11 @@ fn generate_completions(shell: clap_complete::Shell) {
     print_completions(shell, &mut cmd);
 }
 
-fn get_diffs_from_git(mode: &OperationMode) -> Result<Vec<FileDiff>> {
+fn get_diffs_from_git(mode: &OperationMode, one_file_system: bool) -> Result<Vec<FileDiff>> {
     let git_executor = GitExecutor::new();
 
     if let Some((target1, target2)) = git_executor.path_compare_targets(mode)? {
-        return compare::compare_paths(target1, target2);
+        return compare::compare_paths(target1, target2, one_file_system);
     }
 
     // Get overall diff output
